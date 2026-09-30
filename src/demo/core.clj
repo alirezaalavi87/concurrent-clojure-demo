@@ -357,13 +357,11 @@
   older than 21."
   [sections & [{:keys [max-in-flight] :or {max-in-flight 8} :as _opts}]]
   (with-open [^ExecutorService pool (Executors/newFixedThreadPool max-in-flight)]
-    (let [;; submit ALL first, then collect. Doing the deref inside the same
-          ;; mapv would submit task 0, BLOCK on it, submit task 1, block again
-          ;; -- which is sequential execution wearing a parallel costume.
+    (let [;; submit ALL first, then collect. No blocking.
           ;; Measured against the live API: 2068ms serial-ish vs 723ms correct.
           futures (mapv (fn [section]
-                           (submit-task pool ^Callable (fn [] [section (http-fetch section 1)])))
-                         sections)]
+                          (submit-task pool ^Callable (fn [] [section (http-fetch section 1)])))
+                        sections)]
       (mapv (fn [[section result]] (outcome section result))
             (mapv deref futures)))))
 
@@ -412,16 +410,16 @@
   [sections & [{:keys [max-in-flight timeout-ms]
                 :or {max-in-flight 8 timeout-ms 3000} :as _opts}]]
   (with-open [^ExecutorService pool (Executors/newVirtualThreadPerTaskExecutor)]
-    (let [sem (Semaphore. max-in-flight true)]
-      (let [;; ^Callable is essential -- see submit-task above.
-            futures (mapv (fn [section]
-                             (submit-task pool ^Callable
-                                          (fn []
-                                            (with-permit sem
-                                              (http-fetch section 1)))))
-                           sections)]
-        (mapv (fn [section future] (outcome section (deref-safely future timeout-ms)))
-              sections futures)))))
+    (let [sem (Semaphore. max-in-flight true)
+          ;; ^Callable is essential -- see submit-task above.
+          futures (mapv (fn [section]
+                          (submit-task pool ^Callable
+                                       (fn []
+                                         (with-permit sem
+                                           (http-fetch section 1)))))
+                        sections)]
+      (mapv (fn [section future] (outcome section (deref-safely future timeout-ms)))
+            sections futures))))
 
 ;; ---------------------------------------------------------------------------
 ;; 5. core.async io-thread  -- the idiomatic channel version
@@ -483,7 +481,7 @@
                           ;; finishes. The real timeout is the one on the HTTP
                           ;; client; this one is belt-and-braces.
                           (let [[v winner] (async/alts!! [ch (async/timeout timeout-ms)]
-                                                          :priority true)]
+                                                         :priority true)]
                             (if (= winner ch) v ::timeout))))
                sections))))
 
@@ -530,13 +528,13 @@
                          java.util.concurrent.StructuredTaskScope$Joiner/awaitAll)]
         (let [;; .fork hands back a Subtask, which is how you get results back.
               subtasks (mapv (fn [section]
-                                (.fork scope ^Callable
-                                       (fn []
-                                         (with-permit sem
-                                           [section
-                                            (try (http-fetch section 1)
-                                                 (catch Exception e e))]))))
-                              sections)]
+                               (.fork scope ^Callable
+                                      (fn []
+                                        (with-permit sem
+                                          [section
+                                           (try (http-fetch section 1)
+                                                (catch Exception e e))]))))
+                             sections)]
           (.join scope)
           (mapv (fn [section ^StructuredTaskScope$Subtask st]
                   (outcome section
@@ -604,9 +602,9 @@
     ;; 334ms, identical to the virtual-thread version. Pool lease contention,
     ;; not concurrency cost.
     (let [warm (mapv (fn [section]
-                        (future (try (http-fetch section 1)
-                                     (catch Exception _ nil))))
-                      sections)]
+                       (future (try (http-fetch section 1)
+                                    (catch Exception _ nil))))
+                     sections)]
       (doseq [f warm] (deref f 5000 ::timed-out)))
     (Thread/sleep 1000)
     (println (format "   (warmed %d pooled connection(s), untimed)\n" (count sections)))

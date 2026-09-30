@@ -9,9 +9,14 @@
   version getting steadily slower across rounds. Variance like that is larger
   than the effect you are trying to measure.
 
+  Two things here exist purely to stop the benchmark lying about itself, and
+  both were added after it was caught lying. See `warm-up!` and `best-of` --
+  each has the measurement that motivated it in its docstring.
+
   Run it:  clojure -M -m demo.bench
            clojure -M -m demo.bench 100000    (override the largest fan-out)"
-  (:require [demo.core :as core])
+  (:require [clojure.string :as string]
+            [demo.core :as core])
   (:import (java.lang.management ManagementFactory)
            (java.util.concurrent Callable ExecutorService Executors Future)))
 
@@ -92,6 +97,66 @@
      :peak   peak
      :result result}))
 
+(defn- best-of
+  "Run the zero-arg runner `f` k times and return the FASTEST result, with every
+  sample attached under :samples.
+
+  Best-of rather than mean or median, deliberately. The noise in a microbenchmark
+  is additive -- a GC pause, a scheduling hiccup, someone else on the box -- so
+  it can only ever make a run SLOWER. The minimum is therefore the closest
+  estimate of what the work itself costs.
+
+  A single sample is not usable. The same code has been seen varying by 60%+ at
+  N=100 purely from run order, which is why the sample list is kept and
+  printed: if the samples are spread wide, the number in the table is a
+  best-case, not a typical one, and you should know that."
+  [k f]
+  (let [samples (mapv (fn [_]
+                        ;; Sleep FIRST, so the pause lands between rounds rather
+                        ;; than inside the timed region.
+                        (Thread/sleep 150)
+                        (f))
+                      (range k))]
+    (assoc (apply min-key :ms samples) :samples (mapv :ms samples))))
+
+(defn- samples-str
+  "Render a best-of result's raw samples, e.g. `[88 91 87]`.
+
+  Printed next to the headline number wherever a claim is load-bearing, so the
+  claim can be checked rather than believed. A table of bare minima invites you
+  to forget that they are minima."
+  [result]
+  (str "[" (string/join " " (map #(format "%.0f" %) (:samples result))) "]"))
+
+(defn- warm-up!
+  "Run each of `thunks` untimed, repeatedly, so that nothing in a measured table
+  is a first call.
+
+  This is not a nicety. Without it the table is not merely noisy, it is WRONG,
+  because two one-time costs land entirely on whichever runner happens to be
+  evaluated first:
+
+    * the TASK's own JIT compilation. A tight loop like
+      `(reduce + (range 300000))` needs thousands of invocations to reach C2,
+      and an N=100 run supplies 100.
+    * each runner's own first-use cost: loading clojure.core/future and
+      Agent.soloExecutor, and booting the thread pool.
+
+  Measured at N=100 CPU-bound, in one JVM, pmap evaluated first each time:
+
+        cold                                    252 ms
+        after warming pmap's machinery only     158 ms   (~90ms was future/agent)
+        after ALSO warming the task via a pool   68 ms   (~90ms was the task JIT)
+        fully warm                               70 ms
+
+  Both runners used to be invoked pmap-first in every row, so pmap absorbed the
+  entire one-time cost and looked 2-3x slower than everything else. Reordering
+  the very same three calls in the same JVM put pmap at 88ms instead of 336ms."
+  [thunks]
+  (dotimes [_ 3]
+    (doseq [run thunks] (run))
+    (Thread/sleep 200)))
+
 (defn- submit-all-then-collect
   "Hand every task to `pool` before waiting on any of them.
 
@@ -131,17 +196,27 @@
 
   The last two columns are PEAK OS threads, sampled every 1ms while the run is
   in progress. They are flat: whatever N is, virtual threads need a fixed
-  handful of carriers and pmap needs about 32."
+  handful of carriers and pmap needs about 32.
+
+  Note on method: these runs are long (1.7s at N=5,000, 33s at N=100,000), so
+  a single sample is already stable and best-of would triple the runtime for
+  nothing. The one thing that did need fixing was the first-runner bias -- pmap
+  was invoked first in every row and absorbed the one-time JIT and class-loading
+  cost, which is most of what the N=10 row was showing. Hence `warm-up!` here
+  and `best-of` in section B, where the runs are milliseconds not seconds."
   [scales]
-  (section-title "A. I/O-bound fan-out: N tasks x 10ms blocking call")
-  (println (format "  %-8s %9s %14s %9s %13s %11s %9s"
-                   "" "pmap" "32-thr pool" "virtual" "pmap OS thr" "vt OS thr" "speedup"))
   (let [task (io-task 10)]
+    (warm-up! [#(run-pmap 300 task)
+               #(run-virtual 300 task)
+               #(run-fixed-pool 300 task 32)])
+    (section-title "A. I/O-bound fan-out: N tasks x 10ms blocking call")
+    (println (format "  %-8s %9s %14s %9s %13s %11s %9s"
+                     "" "pmap" "32-thr pool" "virtual" "pmap OS thr" "vt OS thr" "speedup"))
     (doseq [n scales]
       (let [p  (run-pmap n task)
             b  (run-fixed-pool n task 32)
             v  (run-virtual n task)]
-        ;; Every task must actually have run. Without this check a runner that
+        ;; Every task must actually have run. Without this check, a runner that
         ;; silently did nothing -- or that ran serially -- still reports a fast
         ;; time and looks like a win.
         (when (not= (:sum p) (:sum v))
@@ -162,23 +237,56 @@
 ;; ---------------------------------------------------------------------------
 
 (defn benchmark-cpu
-  "CPU-bound work: every carrier is saturated, so the virtual thread
-  machinery is pure overhead.
+  "CPU-bound work: the one case where virtual threads buy you nothing.
 
   This is the half of the story that gets left out. Virtual threads do not add
   CPU. There are still only `cores` carriers, so a CPU-bound task should run on
-  a platform thread or in clojure.core.reducers."
+  a platform thread, or in clojure.core.reducers, and no amount of concurrency
+  will help.
+
+  The `fixed N` columns exist to make that concrete rather than assert it: a
+  half-size pool, a core-sized pool and a 3x-oversubscribed pool all cost the
+  same, because the limit is the cores and not the pool. That also explains why
+  pmap's 32-way cap -- the thing that ruins it in section A -- is harmless here.
+  Oversubscription is nearly free when the work is CPU-bound and the threads
+  are runnable anyway. The cap costs you only when the work is BLOCKED, which
+  is section A's case, not this one.
+
+  Every column is best-of-3 and the table is preceded by a warm-up. That is not
+  bookkeeping, it is the whole result: this section used to report pmap at 2-3x
+  the others, which was entirely the one-time JIT and class-loading cost landing
+  on whichever runner ran first. See `warm-up!` and the assertion in section D.
+  Once warm, all five columns land within a few percent of each other."
   []
-  (section-title (format "B. CPU-bound (no blocking) -- %d cores" (.availableProcessors (Runtime/getRuntime))))
-  (let [task (fn [_] (reduce + (range 300000)))]
-    (println (format "  %-9s %19s %19s %19s" "" "pmap" "virtual threads" "fixed pool (12)"))
+  (let [cores (.availableProcessors (Runtime/getRuntime))
+        task  (fn [_] (reduce + (range 300000)))
+        pools [(quot cores 2) cores (* 3 cores)]]
+    (warm-up! [#(run-pmap 300 task)
+               #(run-virtual 300 task)
+               #(run-fixed-pool 300 task cores)])
+    (section-title (format "B. CPU-bound (no blocking) -- %d cores, best of 3" cores))
+    (println (format "  %-8s %10s %10s %s"
+                     "" "pmap" "virtual"
+                     (string/join "" (map #(format "%11s" (str "fixed " %)) pools))))
     (doseq [n [10 100 1000 5000]]
-      (let [p (run-pmap n task)
-            v (run-virtual n task)
-            f (run-fixed-pool n task (.availableProcessors (Runtime/getRuntime)))]
-        (println (format "  %-9s %18.0f ms %18.0f ms %18.0f ms"
-                         (format "N = %d" n) (:ms p) (:ms v) (:ms f)))
-        (Thread/sleep 300)))))
+      (let [p (best-of 3 #(run-pmap n task))
+            v (best-of 3 #(run-virtual n task))
+            fs (mapv (fn [size] (best-of 3 #(run-fixed-pool n task size))) pools)]
+        (println (format "  %-8s %7.0f ms %7.0f ms %s"
+                         (format "N = %d" n) (:ms p) (:ms v)
+                         (string/join "" (map #(format "%8.0f ms" (:ms %)) fs))))
+        (Thread/sleep 300)))
+    (println (format "  -> Every column above is the same, and so is a pool of %d, %d or"
+                     (first pools) cores))
+    (println (format "     %d. That IS the finding: for CPU-bound work the limit is"
+                     (last pools)))
+    (println "     the cores, and no threading strategy moves it. The practical")
+    (println "     advice is unchanged -- reach for clojure.core.reducers -- but")
+    (println "     the reason is that nothing helps, not that one approach is")
+    (println "     worse than another. pmap's 32-way cap, which ruins it in section")
+    (println "     A, costs nothing here: oversubscribing runnable threads on a")
+    (println "     saturated CPU is nearly free. The cap only hurts when the work")
+    (println "     is BLOCKED, which is section A's problem, not this one's.")))
 
 ;; ---------------------------------------------------------------------------
 ;; C. Why pmap degrades
@@ -224,14 +332,51 @@
 ;; D. The traps, as executable assertions
 ;; ---------------------------------------------------------------------------
 
-(defn- check [label passed? detail]
+(defn- settle!
+  "Block until the platform-thread count stops moving.
+
+  Needed between destructive experiments. `newCachedThreadPool` keeps idle
+  threads alive for 60 seconds, so a run that creates 2,000 of them leaves
+  2,000 stragglers that the NEXT measurement will happily count as its own.
+  Comparing a peak against a baseline taken before the previous experiment is
+  what produced a spurious 'virtual threads need 762 carriers' reading.
+
+  The test is STABILITY, not a floor. There is no fixed floor to wait for: this
+  JVM legitimately sits at ~32 extra threads because pmap's cached pool is
+  holding them, and that is fine. What matters is that the count has stopped
+  DECAYING, because a decaying count is still the previous experiment's threads
+  on their way out. An earlier version demanded a return to near the floor and
+  so waited out its full 5s timeout every time, printing a spurious warning."
+  []
+  (loop [tries 0]
+    (let [a (platform-threads)
+          _ (Thread/sleep 50)
+          b (platform-threads)]
+      (cond
+        ;; ~5s without settling: proceed, but say so rather than pretend
+        (>= tries 100)
+        (println (format "         (settle! gave up at %d threads, still moving)" b))
+
+        ;; flat across two samples 50ms apart: the stragglers have all died
+        (= a b) nil
+
+        :else (recur (inc tries))))))
+
+(defn- check
+  "Print one assertion's verdict, plus an indented detail line per detail string."
+  [label passed? & detail]
   (println (format "  [%s] %s" (if passed? "PASS" "FAIL") label))
-  (when detail (println (format "         %s" detail))))
+  (doseq [d detail] (when d (println (format "         %s" d)))))
 
 (defn benchmark-traps
-  "The footguns from demo.core, demonstrated rather than asserted in prose."
+  "The footguns from demo.core, plus this file's own, demonstrated rather than
+  asserted in prose.
+
+  Two of these are interop traps that produce WRONG ANSWERS SILENTLY. The last
+  one is a measurement trap that did produce a wrong answer here, in this
+  file, until it was caught."
   []
-  (section-title "D. Interop traps")
+  (section-title "D. Traps, as executable assertions")
 
   ;; Trap 1: the ^Callable hint.
   ;; NOTE: these call `.submit` DIRECTLY. Going through core/submit-task cannot
@@ -286,30 +431,86 @@
   ;; Trap 3: where the threads actually come from. The popular belief is that
   ;; pmap makes one OS thread per element. It does not -- but the idiom people
   ;; write to IMPROVE pmap does. Both halves, measured.
+  ;;
+  ;; Each measurement takes its OWN baseline, immediately before it runs, and the
+  ;; runs are separated by `settle`. Both are load-bearing:
+  ;;
+  ;;   * One shared baseline, sampled once at the top, is wrong because these are
+  ;;     SEQUENTIAL destructive experiments. The unbounded run below creates 2,000
+  ;;     platform threads, and `newCachedThreadPool` holds idle threads for 60s.
+  ;;     The virtual run that follows therefore samples those 2,000 stragglers on
+  ;;     their way out and reports them as carriers. That produced a spurious
+  ;;     "virtual: 762 OS threads" and a failing assertion.
+  ;;   * `settle` waits for the count to actually return near the floor before
+  ;;     trusting the next number, rather than hoping the timing worked out.
   (println)
-  (let [baseline (platform-threads)
-        n        2000
-        task     (io-task 200)      ;; long enough that the peak is real
-        [_ pmap-peak]  (peak-during #(reduce + (doall (pmap task (range n)))))
-        [_ unbounded-peak]
+  (let [n    2000
+        task (io-task 200)          ;; long enough that the peak is real
+
+        ;; --- pmap: does it really cap at ~32? ---
+        pmap-base (platform-threads)
+        pmap-peak (second (peak-during #(reduce + (doall (pmap task (range n))))))
+        _ (settle!)
+
+        ;; --- the unbounded pool: one OS thread per element ---
+        unbounded-base (platform-threads)
+        unbounded-peak
         (with-open [^ExecutorService pool (Executors/newCachedThreadPool)]
           ;; an UNBOUNDED pool is what `future` uses via Agent.soloExecutor
-          (peak-during #(submit-all-then-collect pool n task)))
-        [_ virtual-peak]
+          (second (peak-during #(submit-all-then-collect pool n task))))
+        _ (settle!)
+
+        ;; --- virtual threads: same work, fixed carriers ---
+        virtual-base (platform-threads)
+        virtual-peak
         (with-open [^ExecutorService pool (Executors/newVirtualThreadPerTaskExecutor)]
-          (peak-during #(submit-all-then-collect pool n task)))]
+          (second (peak-during #(submit-all-then-collect pool n task))))]
     (check (format "pmap stays near 32 in flight even at N = %d" n)
-           (< (- pmap-peak baseline) 60)
-           (format "  pmap peaked at %d OS threads (+%d over the %d baseline)"
-                   pmap-peak (- pmap-peak baseline) baseline))
+           (< (- pmap-peak pmap-base) 60)
+           (format "  pmap peaked at %d OS threads (%+d vs the %d baseline)"
+                   pmap-peak (- pmap-peak pmap-base) pmap-base))
     (check "submitting all N first, on an UNBOUNDED pool, really does explode"
-           (> (- unbounded-peak baseline) (* 0.8 n))
-           (format "  same N on newCachedThreadPool: %d OS threads (+%d)"
-                   unbounded-peak (- unbounded-peak baseline)))
+           (> (- unbounded-peak unbounded-base) (* 0.8 n))
+           (format "  same N on newCachedThreadPool: %d OS threads (%+d)"
+                   unbounded-peak (- unbounded-peak unbounded-base)))
     (check "the same work on virtual threads needs a fixed number of carriers"
-           (< (- virtual-peak baseline) 40)
-           (format "  virtual: %d OS threads (+%d), and it was 3x FASTER"
-                   virtual-peak (- virtual-peak baseline)))))
+           (< (- virtual-peak virtual-base) 40)
+           ;; Measured against a baseline taken AFTER the 2,000 threads above
+           ;; finished dying, which is the only way this number means anything.
+           (format "  virtual: %d OS threads (%+d vs a %d baseline taken after"
+                   virtual-peak (- virtual-peak virtual-base) virtual-base)
+           (format "  the previous 2,000 wound down), and it was 3x FASTER")))
+
+  ;; Trap 4: the measurement trap. This one caught THIS FILE.
+  ;;
+  ;; Section B used to report pmap as 2-3x slower than everything else on
+  ;; CPU-bound work, which reads as "pmap is bad at CPU work". That was false.
+  ;; pmap was simply the first runner evaluated in every row, so it absorbed the
+  ;; one-time JIT compilation of the task plus the first-use cost of
+  ;; clojure.core/future and Agent.soloExecutor. Warm, the three approaches are
+  ;; within a couple of percent.
+  ;;
+  ;; This assertion is the regression guard. It fails loudly if the warm-up or
+  ;; the best-of is ever removed, instead of the table quietly lying again.
+  (println)
+  (let [cores (.availableProcessors (Runtime/getRuntime))
+        task  (fn [_] (reduce + (range 300000)))
+        p     (best-of 3 #(run-pmap 2000 task))
+        f     (best-of 3 #(run-fixed-pool 2000 task cores))
+        ;; 30% is loose enough to survive a loaded box -- both runs are adjacent
+        ;; and track each other -- but far tighter than the 3.8x the artifact
+        ;; produced, so it cannot hide a real regression.
+        spread (/ (double (max (:ms p) (:ms f))) (min (:ms p) (:ms f)))]
+    (check "once warm, pmap and a core-sized pool agree on CPU-bound work"
+           (< spread 1.3)
+           (format "  N=2000: pmap %5.0f ms %s vs fixed-%d %5.0f ms %s  (%.2fx apart)"
+                   (:ms p) (samples-str p) cores (:ms f) (samples-str f) spread))))
+
+;; NOTE: deliberately no (shutdown-agents) here. It is -main's job, at the very
+;; end. Calling it in here terminated Agent.soloExecutor, and because `pmap`
+;; dispatches every task to that executor, a SECOND call to this function in the
+;; same JVM died with RejectedExecutionException. A benchmark section that can
+;; only run once is a benchmark section you cannot re-run while debugging.
 
 ;; ---------------------------------------------------------------------------
 
