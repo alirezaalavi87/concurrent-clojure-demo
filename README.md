@@ -33,7 +33,6 @@ Needs JDK 21+ (virtual threads, `StructuredTaskScope`); developed on JDK 25.
 | `src/demo/core.clj` | the six approaches, each with benefits, drawbacks and its own footgun |
 | `src/demo/bench.clj` | local benchmark — no network, so it is reproducible |
 | `src/demo/bench_net.clj` | live benchmark against the real API, under a hard request budget |
-| `main.clj` | the original scratch file this grew out of; superseded, kept for reference |
 
 ## The approaches
 
