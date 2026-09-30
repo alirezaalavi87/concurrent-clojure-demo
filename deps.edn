@@ -1,0 +1,14 @@
+;; Deps for the concurrency demo.
+;;
+;; The three libraries below each buy something specific:
+;;   core.async  -> `io-thread`, a blocking context that runs on VIRTUAL threads
+;;   clj-http     -> a real HTTP client with connection POOLING and timeouts
+;;   cheshire     -> parses the JSON body (clj-http does not depend on it)
+;;
+;; Everything else here is java.util.concurrent, which ships with the JDK.
+{:paths ["src"]
+
+ :deps {org.clojure/clojure     {:mvn/version "1.12.6"}
+        org.clojure/core.async {:mvn/version "1.10.874-alpha3"}
+        clj-http/clj-http       {:mvn/version "3.13.1"}
+        cheshire/cheshire       {:mvn/version "5.13.0"}}}
