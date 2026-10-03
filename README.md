@@ -1,5 +1,8 @@
 # concurrent-clj
 
+I also have some notes on Clojure concurrency in my
+[personal knowledge base](https://kb.alavi.me/#/page/clojure%20concurrency), maybe they are worth reading.
+
 Six ways to do the same fan-out in Clojure, with the trade-offs written down
 next to the code and the numbers measured rather than asserted.
 
@@ -314,3 +317,9 @@ D. Traps, as executable assertions
 
 done.
 ```
+
+---
+
+Disclaimer: These tests and implementations were heavily helped by an
+LLM agent, but I closely reviewed and directed the agent to the best
+of my knowledge's extent.
